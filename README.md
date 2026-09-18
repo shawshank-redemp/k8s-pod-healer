@@ -153,18 +153,26 @@ package unless you actually construct one of these.
 
 ### Wiring Step 1 -> Step 2
 
-In `detection_module.py`, replace the body of `trigger_diagnosis(pod_info)`:
+This is already wired in `detection_module.py`: `trigger_diagnosis(pod_info)`
+runs `DiagnosisModule.diagnose()` on a background daemon thread, so a slow
+(real) Claude call never blocks the watch loop - `should_diagnose_now()`
+already guarantees it's called at most once per pod per 5-minute window, and
+each dispatch gets its own thread rather than running inline.
+
+By default it lazily creates a mock-backed `DiagnosisModule()` the first
+time a diagnosis fires. To use real clients, call `set_diagnosis_module()`
+before starting the watcher:
 
 ```python
-def trigger_diagnosis(pod_info):
-    diagnosis = diagnosis_module.diagnose(pod_info)
-    print(f"→ DIAGNOSIS: {diagnosis['root_cause']} "
-          f"(confidence={diagnosis['confidence']}) - {diagnosis['recommended_fix']}")
-```
+import detection_module
+import diagnosis_module
 
-The detection loop never blocks on this - `should_diagnose_now()` already
-guarantees `trigger_diagnosis` is only called once per pod per 5-minute
-window, so a slow Claude call doesn't back up the watch stream.
+detection_module.set_diagnosis_module(diagnosis_module.DiagnosisModule(
+    k8s_client=diagnosis_module.RealK8sClient(config_path="~/.kube/config"),
+    claude_client=diagnosis_module.RealClaudeClient(api_key=api_key_from_trueforge),
+))
+detection_module.watch_pod_events()
+```
 
 ### Diagnosis output shape
 

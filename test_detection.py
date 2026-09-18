@@ -11,6 +11,7 @@ Run with:
     python test_detection.py
 """
 
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -308,6 +309,40 @@ def test_9_pending_40_seconds():
     check("long-Pending pod classified as MEDIUM", info["severity"] == "MEDIUM")
 
 
+# --------------------------------------------------------------------------
+# Test 10: trigger_diagnosis dispatches to Step 2 without blocking the caller
+# --------------------------------------------------------------------------
+
+def test_10_trigger_diagnosis_non_blocking():
+    print("\n--- Test 10: trigger_diagnosis Dispatches Without Blocking ---")
+
+    calls = []
+    ran = threading.Event()
+
+    class SlowSpyDiagnosisModule:
+        """Stands in for a real DiagnosisModule with a slow Claude call."""
+        def diagnose(self, pod_info):
+            time.sleep(0.3)
+            calls.append(pod_info["pod_name"])
+            ran.set()
+            return {"root_cause": "test", "severity": "LOW",
+                    "recommended_fix": "n/a", "confidence": 1.0}
+
+    dm.set_diagnosis_module(SlowSpyDiagnosisModule())
+    try:
+        start = time.time()
+        dm.trigger_diagnosis({"pod_name": "spy-test", "namespace": "default",
+                               "pod_id": "default/spy-test"})
+        elapsed = time.time() - start
+        check("trigger_diagnosis returns immediately, doesn't wait for diagnose()",
+              elapsed < 0.1)
+
+        check("diagnosis eventually runs in the background",
+              ran.wait(timeout=2) and calls == ["spy-test"])
+    finally:
+        dm.set_diagnosis_module(None)  # don't leak state into other tests/processes
+
+
 if __name__ == "__main__":
     shrink_timings()
 
@@ -321,5 +356,6 @@ if __name__ == "__main__":
     test_7_image_pull_backoff()
     test_8_crashloop_one_restart()
     test_9_pending_40_seconds()
+    test_10_trigger_diagnosis_non_blocking()
 
     print("\nAll tests passed.")

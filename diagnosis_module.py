@@ -200,9 +200,19 @@ def _get_failed_init_container(pod_object):
 # --------------------------------------------------------------------------
 
 class MockK8sClient(K8sDataFetcher):
-    """Canned Kubernetes responses, configurable per test scenario."""
+    """Canned Kubernetes responses, configurable per test scenario.
 
-    def __init__(self, logs=None, events=None, spec=None, pod_status="Running",
+    pod_status defaults to "Unknown" rather than "Running" on purpose: this
+    class is also what an unconfigured DiagnosisModule() falls back to (see
+    detection_module._get_diagnosis_module()), and DiagnosisModule.diagnose()
+    treats a "Running" status as "pod recovered, skip diagnosis". Defaulting
+    to "Running" would make every diagnosis dispatched through the default,
+    unconfigured pipeline silently report "Pod recovered" regardless of the
+    pod's actual state - which is exactly what happened in testing against a
+    live Kind cluster before this was caught.
+    """
+
+    def __init__(self, logs=None, events=None, spec=None, pod_status="Unknown",
                  init_container_logs=None, raise_not_found=False):
         self._logs = logs if logs is not None else "[MockLog] Container crashed with exit code 137"
         self._events = events if events is not None else [

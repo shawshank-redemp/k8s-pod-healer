@@ -6,6 +6,7 @@ deduplicates diagnoses, filters transient/self-recovering failures, and
 safely extracts pod metadata before handing off to Step 2 (diagnosis).
 """
 
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -303,14 +304,62 @@ def cleanup_old_entries():
 
 
 # --------------------------------------------------------------------------
-# Diagnosis handoff (Step 2 placeholder)
+# Diagnosis handoff (Step 2)
 # --------------------------------------------------------------------------
 
+# Lazily-created DiagnosisModule instance used by trigger_diagnosis(). Left
+# as None until either the first diagnosis is dispatched (defaults to mocks)
+# or set_diagnosis_module() injects a configured one (e.g. with real K8s +
+# Claude clients on hackathon day).
+_diagnosis_module_instance = None
+
+
+def set_diagnosis_module(module):
+    """Inject a configured DiagnosisModule for trigger_diagnosis() to use.
+
+    Call this before watch_pod_events() to swap in real clients:
+
+        import diagnosis_module as dm2
+        set_diagnosis_module(dm2.DiagnosisModule(
+            k8s_client=dm2.RealK8sClient(),
+            claude_client=dm2.RealClaudeClient(api_key=...),
+        ))
+    """
+    global _diagnosis_module_instance
+    _diagnosis_module_instance = module
+
+
+def _get_diagnosis_module():
+    global _diagnosis_module_instance
+    if _diagnosis_module_instance is None:
+        import diagnosis_module
+        _diagnosis_module_instance = diagnosis_module.DiagnosisModule()
+    return _diagnosis_module_instance
+
+
 def trigger_diagnosis(pod_info):
-    """Placeholder hook for Step 2 (diagnosis module) via TrueForge."""
-    print(f"→ DIAGNOSIS: Processing {pod_info['pod_name']} "
-          f"[{pod_info['namespace']}] reason={pod_info['reason']} "
-          f"restarts={pod_info['restart_count']} severity={pod_info['severity']}")
+    """Hand a failing pod off to Step 2 without blocking the watch loop.
+
+    Runs DiagnosisModule.diagnose() on a background daemon thread - a real
+    Claude call can take several seconds, and should_diagnose_now() already
+    guarantees this fires at most once per pod per dedup window, so a
+    lightweight thread-per-diagnosis is enough at hackathon scale (a handful
+    of concurrent failures, not a flood).
+    """
+    thread = threading.Thread(target=_run_diagnosis, args=(pod_info,), daemon=True)
+    thread.start()
+
+
+def _run_diagnosis(pod_info):
+    pod_name = pod_info.get("pod_name", "unknown")
+    try:
+        module = _get_diagnosis_module()
+        diagnosis = module.diagnose(pod_info)
+        print(f"→ DIAGNOSIS: {pod_name} root_cause={diagnosis['root_cause']} "
+              f"severity={diagnosis['severity']} confidence={diagnosis['confidence']} "
+              f"fix={diagnosis['recommended_fix']}")
+    except Exception as exc:
+        print(f"[ERROR] diagnosis thread failed for {pod_name}: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -344,7 +393,7 @@ def watch_pod_events():
     while True:
         w = watch.Watch()
         try:
-            for event in w.stream(v1.list_pod_for_all_namespaces, timeout_seconds=0):
+            for event in w.stream(v1.list_pod_for_all_namespaces):
                 pod = event.get("object")
                 if pod is None:
                     continue

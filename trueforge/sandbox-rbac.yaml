@@ -1,0 +1,42 @@
+# RBAC for the "sandbox" Kubernetes MCP connector.
+#
+# The agent gets TWO Kubernetes connectors:
+#   k8s-prod    - cluster-admin kubeconfig; every write tool needs human approval.
+#   k8s-sandbox - authenticates as the ServiceAccount below, which can ONLY act inside the
+#                 sentinel-sandbox namespace.
+#
+# Because the sandbox connector holds a token that Kubernetes itself refuses to honour outside
+# sentinel-sandbox, "test in the sandbox first" is enforced by the cluster, not just by the
+# agent's prompt: even a confused or prompt-injected agent cannot change production through it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinel-sandbox-sa
+  namespace: sentinel-sandbox
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinel-sandbox-editor
+  namespace: sentinel-sandbox
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "configmaps", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinel-sandbox-editor
+  namespace: sentinel-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: sentinel-sandbox-sa
+    namespace: sentinel-sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinel-sandbox-editor

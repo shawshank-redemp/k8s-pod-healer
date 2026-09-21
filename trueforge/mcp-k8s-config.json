@@ -1,0 +1,19 @@
+{
+  "_comment": "TrueForge remote MCP connectors for Sentinel. Registered by scripts/setup-trueforge.sh, which replaces __MCP_AUTH_TOKEN__ with the token in .sentinel/mcp-auth-token. Servers are started by scripts/start-k8s-mcp.sh (https://github.com/Flux159/mcp-server-kubernetes over Streamable HTTP).",
+  "mcp_servers": [
+    {
+      "type": "remote",
+      "name": "k8s-sandbox",
+      "url": "http://127.0.0.1:3001/mcp",
+      "description": "Kubernetes tools scoped by RBAC to the sentinel-sandbox namespace only. Used for trial runs of a remediation.",
+      "auth": { "type": "header", "headers": { "X-MCP-AUTH": "__MCP_AUTH_TOKEN__" } }
+    },
+    {
+      "type": "remote",
+      "name": "k8s-prod",
+      "url": "http://127.0.0.1:3002/mcp",
+      "description": "Kubernetes tools with full cluster access. Read tools run freely; every write tool is gated behind human approval by the Sentinel agent config.",
+      "auth": { "type": "header", "headers": { "X-MCP-AUTH": "__MCP_AUTH_TOKEN__" } }
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+# CrashLoopBackOff demo: the app crashes immediately because a required env var is missing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-demo-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentinel-demo
+  template:
+    metadata:
+      labels:
+        app: sentinel-demo
+    spec:
+      containers:
+      - name: demo-app
+        image: busybox:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          if [ -z "$REQUIRED_CONFIG" ]; then
+            echo "ERROR: REQUIRED_CONFIG environment variable is not set"
+            exit 1
+          fi
+          echo "App running with config: $REQUIRED_CONFIG"
+          sleep 3600
+        # REQUIRED_CONFIG intentionally missing to cause CrashLoopBackOff
+        resources:
+          limits:
+            memory: "64Mi"
+            cpu: "250m"

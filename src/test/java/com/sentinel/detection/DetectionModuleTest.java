@@ -339,4 +339,111 @@ class DetectionModuleTest {
             DetectionModule.setDiagnosisModule(null);
         }
     }
+
+    // ------------------------------------------------------------------
+    // Sweep: a pod that emits no further events must still be diagnosed on time
+    // ------------------------------------------------------------------
+
+    @Test
+    void testSweepDiagnosesSilentPodWithoutAnotherEvent() throws InterruptedException {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.CountDownLatch called = new java.util.concurrent.CountDownLatch(1);
+        DetectionModule.setDiagnosisModule(info -> {
+            calls.incrementAndGet();
+            called.countDown();
+            return new DiagnosisResult(info.podId(), info.podName(), info.namespace(),
+                "x", "LOW", "x", 1.0, List.of(), 0, "", List.of());
+        });
+        try {
+            Pod pod = makePod("silent-pod", "CrashLoopBackOff", 4); // deep in crash backoff: no more events coming
+            DetectionModule.evaluate(pod);
+            assertTrue(DetectionModule.waitingPods.containsKey("default/silent-pod"), "wait clock started");
+
+            DetectionModule.sweepWaitingPods();
+            assertFalse(called.await(200, java.util.concurrent.TimeUnit.MILLISECONDS), "not due yet - sweep must not fire early");
+
+            sleep(DetectionModule.TRANSIENT_WAIT_SECONDS + 0.2);
+            DetectionModule.sweepWaitingPods(); // no new event arrived; the sweep alone must trigger it
+            assertTrue(called.await(3, java.util.concurrent.TimeUnit.SECONDS), "diagnosed via the sweep");
+
+            DetectionModule.sweepWaitingPods();
+            DetectionModule.sweepWaitingPods();
+            sleep(0.2);
+            assertEquals(1, calls.get(), "repeated sweeps must not dispatch the same pod twice");
+        } finally {
+            DetectionModule.setDiagnosisModule(null);
+        }
+    }
+
+    @Test
+    void testDeletedPodStopsBeingTrackedAndIsNotSwept() throws InterruptedException {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        DetectionModule.setDiagnosisModule(info -> {
+            calls.incrementAndGet();
+            return new DiagnosisResult(info.podId(), info.podName(), info.namespace(),
+                "x", "LOW", "x", 1.0, List.of(), 0, "", List.of());
+        });
+        try {
+            Pod pod = makePod("gone-pod", "CrashLoopBackOff", 4);
+            DetectionModule.evaluate(pod);
+            assertTrue(DetectionModule.waitingPods.containsKey("default/gone-pod"));
+
+            DetectionModule.handlePodDeleted(pod);
+            assertFalse(DetectionModule.waitingPods.containsKey("default/gone-pod"), "deleted pod dropped from the waiting set");
+
+            sleep(DetectionModule.TRANSIENT_WAIT_SECONDS + 0.2);
+            DetectionModule.sweepWaitingPods();
+            sleep(0.2);
+            assertEquals(0, calls.get(), "a pod that no longer exists must never be diagnosed");
+        } finally {
+            DetectionModule.setDiagnosisModule(null);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Severity must not depend on which moment of a crash loop we observed
+    // ------------------------------------------------------------------
+
+    @Test
+    void testSeverityIsTheSameWhicheverCrashLoopReasonWeCatch() {
+        // The same pod flips between these reasons as it crashes and backs off.
+        for (int restarts : new int[] {1, 2, 4}) {
+            assertEquals("HIGH", DetectionModule.classifySeverity("Running", "CrashLoopBackOff", restarts));
+            assertEquals("HIGH", DetectionModule.classifySeverity("Running", "Error", restarts),
+                "Error at " + restarts + " restarts is a crash loop in progress, not MEDIUM");
+            assertEquals("HIGH", DetectionModule.classifySeverity("Running", "OOMKilled", restarts));
+        }
+        for (int restarts : new int[] {5, 8, 50}) {
+            assertEquals("CRITICAL", DetectionModule.classifySeverity("Running", "CrashLoopBackOff", restarts));
+            assertEquals("CRITICAL", DetectionModule.classifySeverity("Running", "Error", restarts));
+            assertEquals("CRITICAL", DetectionModule.classifySeverity("Running", "OOMKilled", restarts));
+        }
+    }
+
+    @Test
+    void testSeverityBoundariesAndUnchangedRules() {
+        assertEquals("MEDIUM", DetectionModule.classifySeverity("Running", "Error", 0), "a first crash with no restart yet");
+        assertEquals("MEDIUM", DetectionModule.classifySeverity("Running", "OOMKilled", 0));
+        assertEquals("HIGH", DetectionModule.classifySeverity("Running", "CrashLoopBackOff", 0), "CrashLoopBackOff was always at least HIGH");
+        assertEquals("HIGH", DetectionModule.classifySeverity("Running", "Error", 1));
+        assertEquals("HIGH", DetectionModule.classifySeverity("Running", "Error", 4));
+        assertEquals("CRITICAL", DetectionModule.classifySeverity("Running", "Error", 5));
+        // Rules that must not have moved:
+        assertEquals("CRITICAL", DetectionModule.classifySeverity("Pending", "ErrImagePull", 0));
+        assertEquals("CRITICAL", DetectionModule.classifySeverity("Failed", "Error", 0), "a Failed pod stays CRITICAL");
+        assertEquals("MEDIUM", DetectionModule.classifySeverity("Pending", "Pending", 0));
+        assertEquals("MEDIUM", DetectionModule.classifySeverity("Running", "Unknown", 0));
+    }
+
+    @Test
+    void testExtractedPodInfoScoresAnErrorStatePodByItsRestarts() {
+        // Reproduces what was seen live: reason=Error with 8 restarts came out MEDIUM.
+        Pod justDied = makePod("looping", "default", "Running", "Error", 8, 120, true, List.of());
+        PodInfo info = DetectionModule.extractPodInfo(justDied);
+        assertEquals("Error", info.reason());
+        assertEquals("CRITICAL", info.severity());
+
+        Pod backingOff = makePod("looping", "default", "Running", "CrashLoopBackOff", 8, 120, false, List.of());
+        assertEquals(info.severity(), DetectionModule.extractPodInfo(backingOff).severity());
+    }
 }

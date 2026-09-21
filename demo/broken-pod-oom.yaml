@@ -1,0 +1,29 @@
+# OOMKilled demo: the app allocates memory in a loop until it exceeds its (too low) limit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-oom-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentinel-oom
+  template:
+    metadata:
+      labels:
+        app: sentinel-oom
+    spec:
+      containers:
+      - name: oom-app
+        image: python:3.11-slim
+        command: ["python3", "-c"]
+        args:
+        - |
+          # Deliberately allocate too much memory
+          data = []
+          while True:
+              data.append(' ' * 1024 * 1024)  # 1MB per iteration
+        resources:
+          limits:
+            memory: "32Mi"  # Too low - will OOMKill

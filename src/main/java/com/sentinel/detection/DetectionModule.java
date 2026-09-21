@@ -1,12 +1,13 @@
 package com.sentinel.detection;
 
-import com.sentinel.diagnosis.DiagnosisModule;
 import com.sentinel.diagnosis.DiagnosisModuleLike;
 import com.sentinel.diagnosis.DiagnosisResult;
+import com.sentinel.trueforge.TrueForgeAgentTrigger;
 import io.fabric8.kubernetes.api.model.ContainerState;
 import io.fabric8.kubernetes.api.model.ContainerStatus;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodCondition;
+import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.fabric8.kubernetes.client.Watch;
@@ -20,6 +21,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -41,8 +44,12 @@ public final class DetectionModule {
     // versions of this project used for the same purpose.
     // ----------------------------------------------------------------------
 
+    // sentinel-sandbox is where the agent runs trial fixes. Watching it would let a failing trial
+    // pod trigger another agent run, which could trigger another - so it's excluded too.
+    // local-path-storage is Kind's built-in storage provisioner: cluster infrastructure, not a
+    // workload, and it crash-loops briefly whenever the API server restarts.
     public static Set<String> EXCLUDED_NAMESPACES =
-        Set.of("kube-system", "kube-node-lease", "kube-public");
+        Set.of("kube-system", "kube-node-lease", "kube-public", "sentinel-sandbox", "local-path-storage");
 
     // Image-pull and container-config errors surface as container *reasons*
     // (state.waiting.reason), not pod phases, so they belong here alongside CrashLoopBackOff.
@@ -163,6 +170,12 @@ public final class DetectionModule {
      * <p>{@code reason} (e.g. CrashLoopBackOff, ImagePullBackOff) drives most of the
      * classification since that's where container-level failure info actually lives; {@code
      * status} (pod phase) is only meaningful on its own for Pending.
+     *
+     * <p>A crash-looping container passes through several reasons: {@code CrashLoopBackOff}
+     * while backing off, but {@code Error}/{@code OOMKilled} at the instant it has just died. The
+     * same pod must not be scored differently depending on which moment we happened to observe,
+     * so those reasons are ranked by restart count exactly like {@code CrashLoopBackOff}: once a
+     * container has restarted it IS a crash loop, and 5+ restarts is CRITICAL.
      */
     public static String classifySeverity(String status, String reason, int restartCount) {
         if ("CrashLoopBackOff".equals(reason)) {
@@ -171,6 +184,9 @@ public final class DetectionModule {
                 .contains(reason)
             || "Failed".equals(status)) {
             return "CRITICAL";
+        } else if ("Error".equals(reason) || "OOMKilled".equals(reason)) {
+            if (restartCount >= 5) return "CRITICAL";
+            return restartCount >= 1 ? "HIGH" : "MEDIUM"; // MEDIUM = first crash, hasn't restarted yet
         } else if ("Pending".equals(status)) {
             return "MEDIUM";
         }
@@ -340,21 +356,21 @@ public final class DetectionModule {
     }
 
     // ----------------------------------------------------------------------
-    // Diagnosis handoff (Step 2)
+    // Agent handoff
     // ----------------------------------------------------------------------
 
-    // Lazily-created DiagnosisModule instance used by triggerDiagnosis(). Left null until
-    // either the first diagnosis is dispatched (defaults to mocks) or setDiagnosisModule()
-    // injects a configured one (e.g. with real K8s + Claude clients on hackathon day).
+    // Optional in-process override. By default a detected failure is handed to the TrueForge
+    // agent. If a DiagnosisModuleLike is injected via setDiagnosisModule(), it runs INSTEAD -
+    // the original local diagnosis path, still handy offline and as a test seam.
     private static volatile DiagnosisModuleLike diagnosisModuleInstance = null;
 
-    // Virtual threads (JDK 21+): cheap enough to spin up one per diagnosis without a pool,
-    // and never block the watch loop's own thread.
+    // Virtual threads (JDK 21+): cheap enough to spin up one per handoff without a pool, and
+    // never block the watch loop's own thread.
     private static final ExecutorService DIAGNOSIS_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
     /**
-     * Inject a configured DiagnosisModule for triggerDiagnosis() to use. Call this before
-     * watchPodEvents() to swap in real clients:
+     * Route failures to a local DiagnosisModule instead of the TrueForge agent (pass null to go
+     * back to TrueForge):
      *
      * <pre>{@code
      * DetectionModule.setDiagnosisModule(new DiagnosisModule(
@@ -365,38 +381,36 @@ public final class DetectionModule {
         diagnosisModuleInstance = module;
     }
 
-    private static DiagnosisModuleLike getDiagnosisModule() {
-        DiagnosisModuleLike instance = diagnosisModuleInstance;
-        if (instance == null) {
-            synchronized (DetectionModule.class) {
-                if (diagnosisModuleInstance == null) {
-                    diagnosisModuleInstance = new DiagnosisModule();
-                }
-                instance = diagnosisModuleInstance;
-            }
-        }
-        return instance;
-    }
-
     /**
-     * Hand a failing pod off to Step 2 without blocking the watch loop.
+     * Hand a failing pod to the TrueForge agent without blocking the watch loop.
      *
-     * <p>Runs DiagnosisModule.diagnose() on a virtual thread - a real Claude call can take
-     * several seconds, and shouldDiagnoseNow() already guarantees this fires at most once per
-     * pod per dedup window, so a thread-per-diagnosis is enough at hackathon scale (a handful of
-     * concurrent failures, not a flood).
+     * <p>The TrueForge call runs on a virtual thread. If TrueForge is unreachable the failure is
+     * logged, the watcher keeps running, and the pod's dedup entry is cleared so the next failure
+     * event retries once TrueForge is back.
      */
     public static void triggerDiagnosis(PodInfo podInfo) {
+        DiagnosisModuleLike override = diagnosisModuleInstance;
         DIAGNOSIS_EXECUTOR.submit(() -> {
+            if (override != null) {
+                try {
+                    DiagnosisResult diagnosis = override.diagnose(podInfo);
+                    System.out.println("→ DIAGNOSIS: " + podInfo.podName()
+                        + " root_cause=" + diagnosis.rootCause()
+                        + " severity=" + diagnosis.severity()
+                        + " confidence=" + diagnosis.confidence()
+                        + " fix=" + diagnosis.recommendedFix());
+                } catch (Exception e) {
+                    System.out.println("[ERROR] diagnosis failed for " + podInfo.podName() + ": " + e);
+                }
+                return;
+            }
             try {
-                DiagnosisResult diagnosis = getDiagnosisModule().diagnose(podInfo);
-                System.out.println("→ DIAGNOSIS: " + podInfo.podName()
-                    + " root_cause=" + diagnosis.rootCause()
-                    + " severity=" + diagnosis.severity()
-                    + " confidence=" + diagnosis.confidence()
-                    + " fix=" + diagnosis.recommendedFix());
+                if (TrueForgeAgentTrigger.trigger(podInfo) != null) {
+                    System.out.println("[Sentinel] TrueForge agent triggered for pod: " + podInfo.podName());
+                }
             } catch (Exception e) {
-                System.out.println("[ERROR] diagnosis failed for " + podInfo.podName() + ": " + e);
+                System.err.println("[Sentinel] Failed to trigger TrueForge agent: " + e.getMessage());
+                processedPods.remove(podInfo.podId()); // allow a retry on the next failure event
             }
         });
     }
@@ -405,7 +419,34 @@ public final class DetectionModule {
     // Main event-driven watch loop
     // ----------------------------------------------------------------------
 
-    private static void handlePodEvent(Pod pod) {
+    /** Serialises evaluation: the watcher thread and the sweeper thread must never both decide the
+     * same pod is due (that would start two agent runs). */
+    private static final Object EVALUATE_LOCK = new Object();
+
+    /** Latest snapshot of each pod currently serving its "still failing?" wait, so the sweeper can
+     * re-check the clock without waiting for another Kubernetes event. Bounded by waitingPods. */
+    private static final Map<String, Pod> lastSeenWaitingPods = new ConcurrentHashMap<>();
+
+    public static double SWEEP_INTERVAL_SECONDS = 5;
+
+    static void handlePodEvent(Pod pod) {
+        evaluate(pod);
+    }
+
+    /** A deleted pod is no longer failing - stop tracking it rather than treating its last
+     * (failing) state as a fresh sighting. */
+    static void handlePodDeleted(Pod pod) {
+        String namespace = pod.getMetadata() != null ? pod.getMetadata().getNamespace() : null;
+        String podName = pod.getMetadata() != null ? pod.getMetadata().getName() : null;
+        if (namespace == null || podName == null) return;
+        String podId = namespace + "/" + podName;
+        synchronized (EVALUATE_LOCK) {
+            waitingPods.remove(podId);
+            lastSeenWaitingPods.remove(podId);
+        }
+    }
+
+    static void evaluate(Pod pod) {
         String namespace = pod.getMetadata() != null ? pod.getMetadata().getNamespace() : null;
         String podName = pod.getMetadata() != null ? pod.getMetadata().getName() : null;
         if (namespace == null || podName == null) return;
@@ -413,30 +454,80 @@ public final class DetectionModule {
 
         String podId = namespace + "/" + podName;
 
-        if (shouldDiagnoseNow(podId, podName, namespace, pod)) {
-            PodInfo info = extractPodInfo(pod);
-            System.out.println("DETECTED: Pod failure - " + podName + " [" + namespace
-                + "] reason=" + info.reason() + " restarts=" + info.restartCount()
-                + " severity=" + info.severity());
-            triggerDiagnosis(info);
+        synchronized (EVALUATE_LOCK) {
+            boolean due = shouldDiagnoseNow(podId, podName, namespace, pod);
+
+            if (waitingPods.containsKey(podId)) lastSeenWaitingPods.put(podId, pod);
+            else lastSeenWaitingPods.remove(podId);
+
+            if (due) {
+                PodInfo info = extractPodInfo(pod);
+                System.out.println("DETECTED: Pod failure - " + podName + " [" + namespace
+                    + "] reason=" + info.reason() + " restarts=" + info.restartCount()
+                    + " severity=" + info.severity());
+                triggerDiagnosis(info);
+            }
+        }
+    }
+
+    /**
+     * Re-check pods that are waiting out the transient-failure window.
+     *
+     * <p>The watch is event-driven, but the 30s wait is time-based: a pod sitting in Kubernetes'
+     * long crash-loop backoff (up to ~5 minutes between restarts) emits no events, so without
+     * this it would never be diagnosed. The sweeper re-evaluates each waiting pod's last-seen
+     * state; any real change still arrives as an event and refreshes that state first.
+     */
+    public static void sweepWaitingPods() {
+        for (String podId : List.copyOf(lastSeenWaitingPods.keySet())) {
+            Pod pod = lastSeenWaitingPods.get(podId);
+            if (pod == null) continue;
+            if (!waitingPods.containsKey(podId)) {
+                lastSeenWaitingPods.remove(podId);
+                continue;
+            }
+            evaluate(pod);
         }
     }
 
     /**
      * Subscribe to pod events across all namespaces and detect failures.
      *
-     * <p>Event-driven (uses the Kubernetes Watch API, not polling). Automatically reconnects on
+     * <p>Event-driven (uses the Kubernetes Watch API, not polling), plus a light sweep that
+     * re-checks pods serving their failure wait so a silent pod is still diagnosed on time.
+     * Automatically reconnects on
      * disconnection after a 5s delay. Runs cleanupOldEntries() every CLEANUP_EVERY_N_EVENTS
      * events to bound memory growth.
      */
     public static void watchPodEvents() {
-        KubernetesClient client = new KubernetesClientBuilder().build();
+        // SENTINEL_KUBE_CONTEXT pins the watcher to one kubeconfig context (the demo scripts set it
+        // to the Kind cluster). Without it, fabric8 uses the current context.
+        String context = System.getenv("SENTINEL_KUBE_CONTEXT");
+        KubernetesClient client = (context == null || context.isBlank())
+            ? new KubernetesClientBuilder().build()
+            : new KubernetesClientBuilder().withConfig(Config.autoConfigure(context)).build();
+        System.out.println("[INFO] Kubernetes context: "
+            + (context == null || context.isBlank() ? "(current context)" : context));
         AtomicInteger eventCount = new AtomicInteger(0);
 
         System.out.println("[INFO] Sentinel detection module starting - watching all namespaces "
             + "(excluding " + EXCLUDED_NAMESPACES + ")");
 
         startWatch(client, eventCount);
+
+        ScheduledExecutorService sweeper = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "sentinel-sweeper");
+            t.setDaemon(true);
+            return t;
+        });
+        long sweepMs = (long) (SWEEP_INTERVAL_SECONDS * 1000);
+        sweeper.scheduleWithFixedDelay(() -> {
+            try {
+                sweepWaitingPods();
+            } catch (Exception e) {
+                System.out.println("[WARN] sweep failed: " + e);
+            }
+        }, sweepMs, sweepMs, TimeUnit.MILLISECONDS);
 
         // Keep the main thread alive - the watch itself runs on client-internal threads.
         Object lock = new Object();
@@ -455,7 +546,8 @@ public final class DetectionModule {
             public void eventReceived(Action action, Pod pod) {
                 eventCount.incrementAndGet();
                 try {
-                    handlePodEvent(pod);
+                    if (action == Action.DELETED) handlePodDeleted(pod);
+                    else handlePodEvent(pod);
                 } catch (Exception e) {
                     System.out.println("[WARN] failed to process event: " + e);
                 }

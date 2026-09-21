@@ -1,0 +1,61 @@
+{
+  "name": "sentinel-agent",
+  "description": "Sentinel: autonomous Kubernetes SRE agent. Investigates pod failures with real Kubernetes tools, verifies a fix in a sandbox first, and pauses for human approval before any production change.",
+  "manifest": {
+    "model": {
+      "name": "__SENTINEL_MODEL__",
+      "params": { "max_tokens": 4096, "temperature": 0 }
+    },
+    "instructions": "__INSTRUCTIONS__",
+    "mcp_servers": [
+      {
+        "name": "k8s-prod",
+        "enable_tools": [
+          "ping",
+          "kubectl_get",
+          "kubectl_describe",
+          "kubectl_logs",
+          "list_api_resources",
+          "explain_resource",
+          "kubectl_apply",
+          "kubectl_patch",
+          "kubectl_scale",
+          "kubectl_rollout",
+          "kubectl_create"
+        ],
+        "require_approval_for_tools": [
+          "kubectl_apply",
+          "kubectl_patch",
+          "kubectl_scale",
+          "kubectl_rollout",
+          "kubectl_create"
+        ],
+        "preload": false
+      },
+      {
+        "name": "k8s-sandbox",
+        "enable_tools": [
+          "ping",
+          "kubectl_get",
+          "kubectl_describe",
+          "kubectl_logs",
+          "kubectl_apply",
+          "kubectl_patch",
+          "kubectl_scale",
+          "kubectl_rollout",
+          "kubectl_create",
+          "kubectl_delete"
+        ],
+        "require_approval_for_tools": [],
+        "preload": false
+      }
+    ],
+    "config": {
+      "sandbox": { "enabled": true },
+      "ask_user_questions": { "enabled": false },
+      "dynamic_sub_agents": { "enabled": false },
+      "generative_ui": { "enabled": false },
+      "iteration_limit": 60
+    }
+  }
+}

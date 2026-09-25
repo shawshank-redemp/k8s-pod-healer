@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Sentinel end-to-end demo.
 #
-#   ./scripts/demo.sh                 CrashLoopBackOff scenario (missing env var)
-#   ./scripts/demo.sh oom             OOMKilled scenario
-#   ./scripts/demo.sh --rehearse      use the scripted mock LLM (no gateway key / no cost) to dry-run
+#   ./scripts/demo.sh                        CrashLoopBackOff scenario (missing env var)
+#   ./scripts/demo.sh oom                    OOMKilled scenario
+#   ./scripts/demo.sh --rehearse             scripted mock LLM (no gateway key / no cost): happy path,
+#                                             real broken->fixed sandbox reproduction, real prod verify
+#   ./scripts/demo.sh --rehearse --refuse    scripted mock LLM that proposes a WRONG fix: the sandbox
+#                                             verification genuinely fails and the agent stops without
+#                                             ever touching production - demonstrates the refusal gate
 #
 # Prerequisites: Docker, kind, kubectl, Java 21 + Maven, Node 22.14+, and TrueForge running:
 #   npx @truefoundry/trueforge@latest            (UI at http://localhost:8790)
@@ -14,18 +18,24 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SCENARIO="crash"
 REHEARSE=0
+REFUSE=0
 for arg in "$@"; do
   case "$arg" in
     oom) SCENARIO="oom" ;;
     crash) SCENARIO="crash" ;;
     --rehearse) REHEARSE=1 ;;
-    *) echo "usage: $0 [crash|oom] [--rehearse]" >&2; exit 2 ;;
+    --refuse) REFUSE=1 ;;
+    *) echo "usage: $0 [crash|oom] [--rehearse] [--refuse]" >&2; exit 2 ;;
   esac
 done
 
 if [ "$REHEARSE" = 1 ] && [ "$SCENARIO" = "oom" ]; then
   echo "ERROR: --rehearse only scripts the crash scenario (the mock model knows sentinel-demo-app)." >&2
   echo "       Use a real model for the oom scenario, or run: $0 crash --rehearse" >&2
+  exit 2
+fi
+if [ "$REFUSE" = 1 ] && [ "$REHEARSE" = 0 ]; then
+  echo "ERROR: --refuse only makes sense with --rehearse (it selects the mock LLM's refusal script)." >&2
   exit 2
 fi
 
@@ -42,7 +52,7 @@ for tool in docker kind kubectl curl python3; do
 done
 ensure_java
 
-echo "=== SENTINEL DEMO ($SCENARIO scenario$([ "$REHEARSE" = 1 ] && echo ', REHEARSAL - scripted model')) ==="
+echo "=== SENTINEL DEMO ($SCENARIO scenario$([ "$REHEARSE" = 1 ] && echo ', REHEARSAL - scripted model')$([ "$REFUSE" = 1 ] && echo ', REFUSAL script')) ==="
 
 echo "Step 1: Start Kind cluster (if not running)"
 if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER_NAME"; then
@@ -63,8 +73,10 @@ if ! curl -sf "$TRUEFORGE_URL/api/v1/capabilities" >/dev/null 2>&1; then
   exit 1
 fi
 if [ "$REHEARSE" = 1 ]; then
-  echo "    starting the scripted mock LLM on :9911"
-  nohup python3 "$SENTINEL_ROOT/demo/mock-llm/mock_llm.py" > "$SENTINEL_RUN_DIR/mock-llm.log" 2>&1 &
+  MOCK_SCENARIO="crash"; [ "$REFUSE" = 1 ] && MOCK_SCENARIO="refuse"
+  echo "    starting the scripted mock LLM on :9911 (scenario: $MOCK_SCENARIO)"
+  SENTINEL_KUBE_CONTEXT="$KUBE_CONTEXT" nohup python3 "$SENTINEL_ROOT/demo/mock-llm/mock_llm.py" \
+    --scenario "$MOCK_SCENARIO" > "$SENTINEL_RUN_DIR/mock-llm.log" 2>&1 &
   echo $! > "$MOCK_PID_FILE"
   wait_for_http "http://127.0.0.1:9911/v1/models" 20 || { echo "ERROR: mock LLM did not start" >&2; exit 1; }
   export SENTINEL_REHEARSE=1
@@ -81,11 +93,18 @@ echo
 echo "Step 5: Start the Sentinel watcher (auto-detects the broken pod, ~30-60s)"
 echo
 echo "Open TrueForge at $TRUEFORGE_URL and watch the run (Sessions). The agent will:"
-echo "  1. Call the Kubernetes tool to fetch logs/events        (REAL TOOL)"
-echo "  2. Validate its fix in the code sandbox                  (SANDBOX)"
-echo "  3. Trial the fix in the sentinel-sandbox namespace       (K8S TEST)"
-echo "  4. PAUSE and ask for your approval in this terminal      (APPROVAL GATE)"
-echo "  5. Apply to production only after you answer 'y'"
+echo "  1. Investigate with evidence: describe the pod + read its logs   (REAL TOOLS)"
+echo "  2. Validate its fix structurally in the code sandbox             (SANDBOX)"
+echo "  3. Reproduce the failure in sentinel-sandbox from the broken manifest, THEN apply and"
+echo "     verify the fix there (status + logs)                         (K8S TEST, broken->healthy)"
+echo "  4. Write a blast-radius report, then PAUSE for your approval     (APPROVAL GATE)"
+echo "  5. Apply to production only after you answer 'y', then verify it recovered there too"
+if [ "$REFUSE" = 1 ]; then
+  echo
+  echo "REFUSAL SCRIPT: the scripted fix is deliberately wrong. The sandbox verification will"
+  echo "genuinely fail and the agent will stop WITHOUT ever proposing a production change - no"
+  echo "approval prompt will appear. That refusal is the point of this run."
+fi
 echo
 echo "(If you'd rather decide in the TrueForge UI, answer 'u' at the prompt.)"
 echo

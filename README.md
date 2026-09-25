@@ -1,8 +1,10 @@
 # Sentinel - Kubernetes pod failure detection & autonomous remediation
 
 Sentinel watches a cluster for failing pods and hands each failure to a **TrueForge agent**
-(Claude via the TrueFoundry AI gateway) that investigates with real Kubernetes tools, proves its
-fix in a sandbox first, and **pauses for a human before changing production**.
+(Claude via the TrueFoundry AI gateway) that investigates with real Kubernetes tools, reproduces
+the failure and proves its fix in a sandbox first, explains the exact blast radius, **pauses for a
+human before changing production**, and verifies recovery on both sides - refusing to proceed at
+all if its own sandbox verification fails.
 
 ```
  Kind cluster ──events──▶ DetectionModule (Java) ──POST session+turn──▶ TrueForge (:8790)
@@ -30,9 +32,9 @@ fix in a sandbox first, and **pauses for a human before changing production**.
 
 | Requirement | How |
 |---|---|
-| **Real tool reached** | The agent calls the Kubernetes MCP server ([Flux159/mcp-server-kubernetes](https://github.com/Flux159/mcp-server-kubernetes), Streamable HTTP) through TrueForge: `kubectl_get`, `kubectl_logs`, `kubectl_describe`, ... You can see each call in the run's tool log. |
-| **Code run in a sandbox** | The agent uses TrueForge's `exec` sandbox tool to write and validate its fix (parse the patch, `sleep 30`), then trials it in the `sentinel-sandbox` Kubernetes namespace through a connector that is RBAC-limited to that namespace. |
-| **Pause before irreversible** | Every write tool on the `k8s-prod` connector has `require_approval_for_tools`. The turn ends with `tool.approval_required`; Sentinel shows the exact change and waits for a human. |
+| **Real tool reached** | The agent calls the Kubernetes MCP server ([Flux159/mcp-server-kubernetes](https://github.com/Flux159/mcp-server-kubernetes), Streamable HTTP) through TrueForge: `kubectl_get`, `kubectl_describe`, `kubectl_logs`, ... on the specific failing pod, not just a namespace list - you can see each real call and its real response in the run's tool log. |
+| **Code run in a sandbox** | The agent uses TrueForge's `exec` sandbox tool to validate its fix structurally, then **reproduces the failure for real**: it applies the workload's original, unfixed manifest to the `sentinel-sandbox` namespace, confirms it fails the same way, applies its fix on top of that, and confirms the sandbox pod reaches Running/Ready with clean logs - a real broken-to-healthy transition, not a pre-fixed manifest. |
+| **Pause before irreversible** | Every write tool on the `k8s-prod` connector has `require_approval_for_tools`. Before pausing, the agent writes a blast-radius report (target, exact diff, expected effect, sandbox evidence, risk); the turn then ends with `tool.approval_required` and waits for a human. If sandbox verification failed, the agent stops on its own and never reaches this step at all - see `--refuse` below. |
 
 ### Design decisions worth knowing
 
@@ -61,6 +63,11 @@ fix in a sandbox first, and **pauses for a human before changing production**.
   backing off but `Error`/`OOMKilled` the instant it dies. All three are ranked by restart count
   (1-4 HIGH, 5+ CRITICAL) so the same pod isn't scored differently depending on when it was seen.
 - **No auto-approve exists.** The only decision paths are a human at the terminal or in the UI.
+- **The agent can refuse on its own.** If the sandbox verification after applying a fix shows the
+  pod still broken, the instructions require the agent to stop and explain why instead of
+  proceeding - it never even reaches the approval-gated production tool call in that case. See the
+  `--refuse` rehearsal scenario below, which forces this by scripting a deliberately wrong patch;
+  the sandbox failure it hits is real, not asserted.
 - Secrets: the MCP servers are protected by an `X-MCP-AUTH` token generated into the git-ignored
   `.sentinel/` folder; model/sandbox keys come from environment variables. Nothing is committed.
 
@@ -73,7 +80,7 @@ fix in a sandbox first, and **pauses for a human before changing production**.
 | `trueforge/mcp-k8s-config.json` | The two Kubernetes MCP connectors |
 | `trueforge/sandbox-rbac.yaml` | ServiceAccount/Role that confine `k8s-sandbox` to `sentinel-sandbox` |
 | `demo/broken-pod.yaml`, `demo/broken-pod-oom.yaml` | Deliberately broken workloads |
-| `demo/mock-llm/mock_llm.py` | Scripted model for `--rehearse` |
+| `demo/mock-llm/mock_llm.py` | Scripted model for `--rehearse` (`crash` happy path, `--refuse` refusal scenario) |
 | `scripts/` | Setup, MCP start/stop, TrueForge registration, demo |
 
 TrueForge defines agents as JSON manifests saved through its API (there is no YAML agent file), so
@@ -89,8 +96,15 @@ Docker, [kind](https://kind.sigs.k8s.io), `kubectl`, Java 21 + Maven, Node 22.14
 # 1. TrueForge, in its own terminal (UI: http://localhost:8790)
 npx @truefoundry/trueforge@latest
 
-# 2a. Dry run with a scripted model - no keys, no cost. Proves the whole pipeline.
+# 2a. Dry run with a scripted model - no keys, no cost. Proves the whole pipeline: evidence-based
+#     investigation, a real broken->fixed sandbox reproduction, a blast-radius report, the approval
+#     pause, and a verified production recovery.
 ./scripts/demo.sh --rehearse
+
+# 2a-refuse. Same, but the scripted fix is deliberately wrong: the sandbox verification genuinely
+#     fails and the agent stops WITHOUT ever proposing a production change - no approval prompt
+#     appears at all. This is the "knows when to stop" moment.
+./scripts/demo.sh --rehearse --refuse
 
 # 2b. Real run. Point TrueForge at your TrueFoundry AI gateway (or add the model in the UI:
 #     Settings -> Models), and ideally enable the isolated Daytona sandbox.
@@ -104,7 +118,9 @@ export DAYTONA_API_KEY=...                # optional but recommended, see caveat
 
 `demo.sh` creates the Kind cluster if needed, sets up `sentinel-sandbox`, starts both MCP servers,
 registers connectors + the agent in TrueForge, deploys a broken workload, and starts the watcher.
-About 30-60 seconds later the terminal shows the approval prompt:
+Detection fires within ~30-60s; the full investigate -> reproduce -> fix -> verify sequence in the
+`--rehearse` script then takes roughly 2 minutes (it waits for real rollouts in between steps), after
+which the terminal shows the blast-radius report followed by the approval prompt:
 
 ```
 ======================= APPROVAL REQUIRED =======================
@@ -140,14 +156,25 @@ Individual pieces, if you want them: `scripts/setup-sandbox.sh`, `scripts/teardo
   or cluster access, so it *validates the fix artifacts*; the *cluster-level* trial is the
   `sentinel-sandbox` namespace. Without `DAYTONA_API_KEY`, TrueForge falls back to a **local**
   sandbox that runs on your machine and is **not isolated** - set the key before a real demo.
-- **What was verified live vs. not.** Verified end to end on Kind with TrueForge running: detection,
-  MCP tool discovery and calls, sandbox `exec`, sandbox-namespace trial, the approval pause, and all
-  three decision paths (approve -> production patched and pod `Running`; deny -> production untouched;
-  decide-in-UI -> run resumed), 3 crashing replicas -> one run and one prompt (one approval fixed
-  all three), and the watcher reconnecting after the API server was restarted mid-run. The *model* in those runs was the scripted mock LLM. A run with a
-  real Claude model through the TrueFoundry gateway, and with Daytona, needs your credentials and
-  has **not** been run.
-- `--rehearse` scripts only the crash scenario. The OOM scenario needs a real model.
+- **What was verified live vs. not.** Verified end to end on Kind with TrueForge running, with real
+  pod state checked via `kubectl` before/after each step (not just the agent's own narration):
+  detection; MCP tool discovery and calls; evidence-based investigation (`kubectl_describe` +
+  `kubectl_logs` on the specific pod, not a namespace list); a genuine broken -> healthy sandbox
+  reproduction (the sandbox pod was confirmed `CrashLoopBackOff` before the fix and `Running`/`Ready`
+  with clean logs after it); the blast-radius report; the approval pause and all three decision paths
+  (approve -> production patched, verified `Running` with the correct env and clean logs; deny ->
+  production untouched; decide-in-UI -> run resumed); the **refusal path** (`--refuse`: a
+  deliberately wrong patch left the sandbox pod genuinely still broken, and the agent stopped without
+  ever calling a production write tool - zero approval prompts, production genuinely untouched); 3
+  crashing replicas -> one run and one prompt (one approval fixed all three); and the watcher
+  reconnecting after the API server was restarted mid-run. The *model* in all of those runs was the
+  scripted mock LLM - real tool calls and real cluster state, scripted choice of which tool to call
+  next. A run with a real Claude model through the TrueFoundry gateway, and with Daytona, needs your
+  credentials and has **not** been run; the instructions (`trueforge/sentinel-instructions.md`) are
+  written for a real model to follow this same evidence -> reproduce -> verify -> report -> approve
+  -> verify loop and to generate its own patch rather than use a canned one, but that reasoning has
+  only been exercised by the mock script's scripted choices, not by an actual model.
+- `--rehearse` (and `--refuse`) script only the crash scenario. The OOM scenario needs a real model.
 - TrueForge's local (`npx`) mode has no login and is for localhost only.
 
 ## Stack

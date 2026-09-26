@@ -18,6 +18,22 @@ all if its own sandbox verification fails.
    human answers y/N in the terminal (or in the TrueForge UI) ──resume turn──┘
 ```
 
+**For demos/presenting, use the incident dashboard (`http://localhost:9912`), not the TrueForge chat
+UI.** TrueForge's own UI is a chat transcript - fine for debugging, unreadable to present live.
+`demo.sh` starts a small dashboard (`demo/dashboard/server.py`) that polls the same real run and
+renders it as a stage tracker (Detected -> Investigating -> Sandbox verification -> Blast-radius
+report -> Awaiting approval -> Production -> Resolved/Stopped) with a real Approve/Deny button. It
+is read-only reporting on the real API plus that one real write; nothing about the agent changes.
+The page opens on a blank "monitoring, no active incident" state (any session older than when the
+dashboard itself started is ignored), then fills in one stage at a time as the real run happens -
+watch that live rather than opening the page on an already-finished run, or it just looks like a
+screenshot. Every fact shown (sandbox reproduced broken, fix verified healthy, who approved,
+production verified) is read from the actual turn state or the literal content of a tool response,
+never from the model's own claims - a status snapshot that catches a still-crashing pod mid-restart
+looking momentarily "Running" is not enough by itself, so health is only "done" when the status
+check AND the following log read both look healthy. Each stage shows the real tool calls that
+happened during it, collapsed by default - click one to see its actual request/response JSON.
+
 - **Detection** (`com.sentinel.detection.DetectionModule`): event-driven watcher that filters
   transient/self-recovering failures, dedups, and classifies severity.
 - **TrueForge handoff** (`com.sentinel.trueforge.TrueForgeAgentTrigger`): starts the agent run,
@@ -81,6 +97,7 @@ all if its own sandbox verification fails.
 | `trueforge/sandbox-rbac.yaml` | ServiceAccount/Role that confine `k8s-sandbox` to `sentinel-sandbox` |
 | `demo/broken-pod.yaml`, `demo/broken-pod-oom.yaml` | Deliberately broken workloads |
 | `demo/mock-llm/mock_llm.py` | Scripted model for `--rehearse` (`crash` happy path, `--refuse` refusal scenario) |
+| `demo/dashboard/server.py` | Incident dashboard for presenting - `http://localhost:9912` |
 | `scripts/` | Setup, MCP start/stop, TrueForge registration, demo |
 
 TrueForge defines agents as JSON manifests saved through its API (there is no YAML agent file), so
@@ -117,10 +134,12 @@ export DAYTONA_API_KEY=...                # optional but recommended, see caveat
 ```
 
 `demo.sh` creates the Kind cluster if needed, sets up `sentinel-sandbox`, starts both MCP servers,
-registers connectors + the agent in TrueForge, deploys a broken workload, and starts the watcher.
-Detection fires within ~30-60s; the full investigate -> reproduce -> fix -> verify sequence in the
-`--rehearse` script then takes roughly 2 minutes (it waits for real rollouts in between steps), after
-which the terminal shows the blast-radius report followed by the approval prompt:
+registers connectors + the agent in TrueForge, starts the **incident dashboard** on
+`http://localhost:9912`, deploys a broken workload, and starts the watcher. Detection fires within
+~30-60s; the full investigate -> reproduce -> fix -> verify sequence in the `--rehearse` script then
+takes roughly 2 minutes (it waits for real rollouts in between steps). Watch it on the dashboard -
+it fills in one stage at a time and ends with a real Approve/Deny button - or in the terminal, which
+shows the same pause:
 
 ```
 ======================= APPROVAL REQUIRED =======================
@@ -131,9 +150,9 @@ which the terminal shows the blast-radius report followed by the approval prompt
 Approve this production change? [y = approve / N = deny / u = decide in UI]:
 ```
 
-`y` applies it (the agent then waits and verifies recovery), `N`/Enter denies (the agent is told
-why and stops), `u` leaves it to the TrueForge UI (Sessions -> the run -> resume). Without a terminal
-Sentinel defers to the UI automatically.
+Approving on the dashboard, answering `y` here, or resuming in the TrueForge UI (`u`) all resume the
+exact same paused run - use whichever is on screen. `N`/Enter denies (the agent is told why and
+stops). Without a terminal Sentinel defers to the UI/dashboard automatically.
 
 Individual pieces, if you want them: `scripts/setup-sandbox.sh`, `scripts/teardown-sandbox.sh`,
 `scripts/start-k8s-mcp.sh` / `stop-k8s-mcp.sh`, `scripts/setup-trueforge.sh` (idempotent).
@@ -176,6 +195,13 @@ Individual pieces, if you want them: `scripts/setup-sandbox.sh`, `scripts/teardo
   only been exercised by the mock script's scripted choices, not by an actual model.
 - `--rehearse` (and `--refuse`) script only the crash scenario. The OOM scenario needs a real model.
 - TrueForge's local (`npx`) mode has no login and is for localhost only.
+- **The dashboard buckets tool calls into stages by position, not by reading the model's prose.**
+  Everything before the first `k8s-sandbox` call is "investigating," from there up to the
+  production write call is "sandbox," the write call onward is "production" - this holds for any
+  model that follows the order `sentinel-instructions.md` requires, scripted or real. The one piece
+  of free text it still matches on is finding the blast-radius report itself (it has to look for
+  that paragraph to display it), so a real model would need to actually write one for that one card
+  to appear - the stage tracker, evidence, and approval state don't depend on it.
 
 ## Stack
 

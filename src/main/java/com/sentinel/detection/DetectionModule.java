@@ -60,7 +60,12 @@ public final class DetectionModule {
     public static Set<String> FAILURE_PHASES = Set.of("Failed", "Pending");
 
     public static double DEDUP_WINDOW_SECONDS = 5 * 60; // don't re-diagnose within 5 min
-    public static double TRANSIENT_WAIT_SECONDS = 30; // must be failing continuously for 30s
+    // Must be failing continuously for this long before Sentinel acts, so a pod that fails once
+    // and immediately recovers is never diagnosed. 30s is the safe default for a real cluster;
+    // SENTINEL_TRANSIENT_WAIT_SECONDS lets a live demo shorten it so detection feels immediate,
+    // without changing the default anyone relying on the loophole-handling behavior gets.
+    public static double TRANSIENT_WAIT_SECONDS =
+        Double.parseDouble(System.getenv().getOrDefault("SENTINEL_TRANSIENT_WAIT_SECONDS", "30"));
     public static double WAITING_STALE_TIMEOUT_SECONDS = 60; // forget "waiting" pods after 1 min
     public static double PENDING_MIN_AGE_SECONDS = 30; // ignore brand-new Pending pods
     public static int MIN_RESTART_COUNT_CRASHLOOP = 1; // diagnose CrashLoopBackOff after 1+ restarts

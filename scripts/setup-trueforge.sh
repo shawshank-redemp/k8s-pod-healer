@@ -12,6 +12,8 @@
 #   TRUEFOUNDRY_GATEWAY_URL    base URL of your TrueFoundry AI gateway  \  configure the model
 #   TRUEFOUNDRY_API_KEY        gateway API key                          /  provider when both set
 #   SENTINEL_GATEWAY_MODEL_ID  gateway model id to expose (e.g. your Claude model)
+#   OPENAI_API_KEY             direct OpenAI key (or put it in .sentinel/openai-api-key, git-ignored)
+#   SENTINEL_OPENAI_MODEL      which OpenAI model id to use            (default gpt-4.1)
 #   SENTINEL_MODEL             model FQN the agent should use; auto-detected if unset
 #   DAYTONA_API_KEY            enables the isolated Daytona code sandbox
 #   SENTINEL_REHEARSE=1        use the scripted mock LLM (demo/mock-llm) instead of a real model
@@ -80,9 +82,28 @@ print(json.dumps({"manifest": {
                 "properties": {"context_length": 200000, "max_output_tokens": 8192}}]}}))
 ')"
   api PUT /settings/model-providers "$payload" >/dev/null
+elif [ -n "${OPENAI_API_KEY:-}" ] || [ -s "$SENTINEL_ROOT/.sentinel/openai-api-key" ]; then
+  echo "==> Configuring OpenAI model provider"
+  OPENAI_API_KEY="${OPENAI_API_KEY:-$(cat "$SENTINEL_ROOT/.sentinel/openai-api-key")}"
+  export OPENAI_API_KEY
+  OPENAI_MODEL_ID="${SENTINEL_OPENAI_MODEL:-gpt-4.1}"
+  export OPENAI_MODEL_ID
+  payload="$(py '
+import json, os, re
+mid = os.environ["OPENAI_MODEL_ID"]
+name = re.sub(r"[^a-z0-9-]+", "-", mid.lower()).strip("-")[:60] or "openai-model"
+print(json.dumps({"manifest": {
+    "type": "openai",
+    "auth": {"api_key": os.environ["OPENAI_API_KEY"]},
+    "models": [{"model_id": mid, "name": name,
+                "properties": {"context_length": 200000, "max_output_tokens": 8192}}]}}))
+')"
+  api PUT /settings/model-providers "$payload" >/dev/null
+  echo "    registered model: $OPENAI_MODEL_ID"
 else
-  echo "==> Skipping model provider (set TRUEFOUNDRY_GATEWAY_URL, TRUEFOUNDRY_API_KEY, SENTINEL_GATEWAY_MODEL_ID"
-  echo "    to configure it here, or add one in TrueForge: Settings -> Models)"
+  echo "==> Skipping model provider (set TRUEFOUNDRY_GATEWAY_URL, TRUEFOUNDRY_API_KEY, SENTINEL_GATEWAY_MODEL_ID,"
+  echo "    or OPENAI_API_KEY / .sentinel/openai-api-key, to configure it here, or add one in TrueForge:"
+  echo "    Settings -> Models)"
 fi
 
 # --- 3. sandbox provider (Daytona) ------------------------------------------------------------

@@ -160,10 +160,6 @@ def compute_state():
         phase = "running" if run_status == "running" else "done"
         approval_info = None
 
-    outcome = None
-    if final_text:
-        outcome = "resolved" if decision == "allow" else ("denied" if decision == "deny" else "stopped")
-
     # Bucket the real calls by position: everything before the first k8s-sandbox call is
     # "investigating"; from there up to (not including) the production write call is "sandbox";
     # the write call onward is "production". Positional, not keyword-based - it works the same
@@ -210,6 +206,20 @@ def compute_state():
     blast_status = status_of(blast_radius is not None, sandbox_status == "done", finished)
     approval_status = "done" if decision is not None else ("active" if phase == "paused" else "pending")
     production_status = status_of(production_verified, decision == "allow", finished)
+
+    # "resolved" requires production_verified to actually be true, not just an approval decision -
+    # a model can apply the patch and then end its turn without ever checking back (seen live: it
+    # said "I will verify..." and stopped). That is a real, distinct outcome from a genuine
+    # verified fix, and showing a green "resolved" banner over it would contradict the Production
+    # stage's own red marker right above it.
+    outcome = None
+    if final_text:
+        if decision == "allow":
+            outcome = "resolved" if production_verified else "unverified"
+        elif decision == "deny":
+            outcome = "denied"
+        else:
+            outcome = "stopped"
 
     # The first turn's own input is the literal alert Sentinel wrote to open this TrueForge
     # session - real evidence of the handoff, not narration, so show it as the "request" that
@@ -410,9 +420,11 @@ button:disabled { opacity:.5; cursor:default; }
 .outcome { margin-top: 20px; padding: 20px; border-radius: 12px; font-size: 15px; }
 .outcome.resolved { background: rgba(61,220,132,.1); border:1px solid var(--green); }
 .outcome.stopped, .outcome.denied { background: rgba(255,92,92,.08); border:1px solid var(--red); }
+.outcome.unverified { background: rgba(255,184,76,.08); border:1px solid var(--amber); }
 .outcome h2 { margin:0 0 8px; font-size: 18px; }
 .outcome.resolved h2 { color: var(--green); }
 .outcome.stopped h2, .outcome.denied h2 { color: var(--red); }
+.outcome.unverified h2 { color: var(--amber); }
 .idle { color: var(--dim); font-size: 15px; margin-top: 40px; text-align:center; }
 .idle .big { font-size: 20px; color: var(--text); margin-bottom: 8px; }
 .err { color: var(--red); margin-top: 20px; }
@@ -544,6 +556,10 @@ function render(st) {
     html += `<div class="outcome denied"><h2>&#128721; Denied — production left untouched</h2>A human denied the production change. Sentinel did not apply it.</div>`;
   } else if (st.outcome === 'stopped') {
     html += `<div class="outcome stopped"><h2>&#128721; Agent stopped itself — verification failed</h2>${esc(st.final_text)}</div>`;
+  } else if (st.outcome === 'unverified') {
+    html += `<div class="outcome unverified"><h2>&#9888; Approved and applied — but never verified</h2>` +
+      `The agent applied the production patch, then ended its turn without checking whether it actually recovered. ` +
+      `Check the live cluster state above for the real, current status.<br><br>${esc(st.final_text)}</div>`;
   }
   root.innerHTML = html;
 }

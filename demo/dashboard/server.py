@@ -302,8 +302,12 @@ button:disabled { opacity:.5; cursor:default; }
 .idle .big { font-size: 20px; color: var(--text); margin-bottom: 8px; }
 .err { color: var(--red); margin-top: 20px; }
 a.sess { color: var(--blue); font-size: 13px; }
+#disconnected { display:none; position:fixed; top:0; left:0; right:0; z-index:100; background:var(--red);
+  color:#200; font-weight:700; text-align:center; padding:10px; align-items:center; justify-content:center; gap:8px; }
 </style></head>
-<body><div class="wrap">
+<body>
+<div id="disconnected">&#9888; Lost connection to Sentinel's dashboard server - what's shown below is frozen, not live. Restart it and reload this page.</div>
+<div class="wrap">
   <h1><span class="dot" id="livedot"></span> Sentinel</h1>
   <div class="sub" id="sub">Monitoring Kubernetes &middot; agent runtime: TrueForge (Claude)</div>
   <div id="root"></div>
@@ -381,8 +385,20 @@ function render(st) {
   root.innerHTML = html;
 }
 
+let failCount = 0;
 async function poll() {
-  try { render(await (await fetch('/api/state')).json()); } catch (e) { /* transient, retry next tick */ }
+  try {
+    const r = await fetch('/api/state');
+    if (!r.ok) throw new Error('http ' + r.status);
+    render(await r.json());
+    failCount = 0;
+    $('disconnected').style.display = 'none';
+  } catch (e) {
+    failCount++;
+    // A couple of misses can be a normal blip; only surface it once it's clearly not coming back,
+    // so the page never just freezes silently on stale content with no sign anything is wrong.
+    if (failCount >= 3) $('disconnected').style.display = 'flex';
+  }
 }
 poll();
 setInterval(poll, 1500);

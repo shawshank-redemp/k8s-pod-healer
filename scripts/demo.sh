@@ -2,7 +2,8 @@
 # Sentinel end-to-end demo.
 #
 #   ./scripts/demo.sh                        CrashLoopBackOff scenario (missing env var)
-#   ./scripts/demo.sh oom                    OOMKilled scenario
+#   ./scripts/demo.sh oom                    OOMKilled scenario (needs a real model)
+#   ./scripts/demo.sh image                  ImagePullBackOff scenario (needs a real model)
 #   ./scripts/demo.sh --rehearse             scripted mock LLM (no gateway key / no cost): happy path,
 #                                             real broken->fixed sandbox reproduction, real prod verify
 #   ./scripts/demo.sh --rehearse --refuse    scripted mock LLM that proposes a WRONG fix: the sandbox
@@ -23,15 +24,16 @@ for arg in "$@"; do
   case "$arg" in
     oom) SCENARIO="oom" ;;
     crash) SCENARIO="crash" ;;
+    image) SCENARIO="image" ;;
     --rehearse) REHEARSE=1 ;;
     --refuse) REFUSE=1 ;;
-    *) echo "usage: $0 [crash|oom] [--rehearse] [--refuse]" >&2; exit 2 ;;
+    *) echo "usage: $0 [crash|oom|image] [--rehearse] [--refuse]" >&2; exit 2 ;;
   esac
 done
 
-if [ "$REHEARSE" = 1 ] && [ "$SCENARIO" = "oom" ]; then
+if [ "$REHEARSE" = 1 ] && [ "$SCENARIO" != "crash" ]; then
   echo "ERROR: --rehearse only scripts the crash scenario (the mock model knows sentinel-demo-app)." >&2
-  echo "       Use a real model for the oom scenario, or run: $0 crash --rehearse" >&2
+  echo "       Use a real model for the oom/image scenarios, or run: $0 crash --rehearse" >&2
   exit 2
 fi
 if [ "$REFUSE" = 1 ] && [ "$REHEARSE" = 0 ]; then
@@ -93,7 +95,11 @@ echo $! > "$DASHBOARD_PID_FILE"
 wait_for_http "http://127.0.0.1:$DASHBOARD_PORT/api/state" 10 || echo "WARNING: dashboard did not start, check $SENTINEL_RUN_DIR/dashboard.log" >&2
 
 echo "Step 4: Deploy a deliberately broken workload to trigger Sentinel"
-if [ "$SCENARIO" = "oom" ]; then MANIFEST="$SENTINEL_ROOT/demo/broken-pod-oom.yaml"; else MANIFEST="$SENTINEL_ROOT/demo/broken-pod.yaml"; fi
+case "$SCENARIO" in
+  oom) MANIFEST="$SENTINEL_ROOT/demo/broken-pod-oom.yaml" ;;
+  image) MANIFEST="$SENTINEL_ROOT/demo/broken-pod-image.yaml" ;;
+  *) MANIFEST="$SENTINEL_ROOT/demo/broken-pod.yaml" ;;
+esac
 kc delete -f "$MANIFEST" --ignore-not-found >/dev/null 2>&1 || true
 "$SENTINEL_ROOT/scripts/teardown-sandbox.sh" >/dev/null 2>&1 || true
 kc apply -f "$MANIFEST"

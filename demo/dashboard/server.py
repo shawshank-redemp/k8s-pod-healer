@@ -29,6 +29,7 @@ Stdlib only. Reads TRUEFORGE_URL from the environment (default http://localhost:
 import argparse
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -236,12 +237,14 @@ def compute_state():
          "calls": production_calls},
     ]
 
+    pod_ref = (session.get("metadata") or {}).get("pod")
     return {
         "phase": phase, "session_id": sid, "session_url": f"{TRUEFORGE_URL}/sessions/{sid}",
-        "pod": (session.get("metadata") or {}).get("pod"),
+        "pod": pod_ref,
         "workload": (session.get("metadata") or {}).get("workload"),
         "severity": (session.get("metadata") or {}).get("severity"),
         "model": get_agent_model(),
+        "live_pod": get_live_pod_status(pod_ref),
         "decision": decision, "outcome": outcome, "final_text": final_text, "stages": stages,
         "approval": approval_info,
     }
@@ -259,6 +262,33 @@ def get_agent_model():
     except (urllib.error.URLError, TimeoutError):
         pass
     return None
+
+
+def get_live_pod_status(pod_ref):
+    """Real, right-now status of the originally-alerted pod, straight from kubectl - not TrueForge,
+    not cached, re-fetched on every poll. If the pod no longer exists (e.g. replaced by a rollout
+    after a fix), that's reported plainly rather than hidden - no fabricated numbers, ever."""
+    if not pod_ref or "/" not in pod_ref:
+        return None
+    namespace, name = pod_ref.split("/", 1)
+    try:
+        out = subprocess.run(
+            ["kubectl", "get", "pod", name, "-n", namespace, "-o", "json"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return {"exists": False, "namespace": namespace, "name": name}
+        pod = json.loads(out.stdout)
+        containers = (pod.get("status") or {}).get("containerStatuses") or [{}]
+        cs = containers[0]
+        return {
+            "exists": True, "namespace": namespace, "name": name,
+            "phase": (pod.get("status") or {}).get("phase"),
+            "ready": bool(cs.get("ready", False)),
+            "restart_count": cs.get("restartCount", 0),
+            "node": (pod.get("spec") or {}).get("nodeName"),
+        }
+    except Exception:
+        return None
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -279,6 +309,14 @@ h1 { font-size: 26px; margin: 0 0 4px; display:flex; align-items:center; gap:12p
 .badge b { color:var(--text); }
 .sev-HIGH { border-color: var(--amber); color: var(--amber); }
 .sev-CRITICAL { border-color: var(--red); color: var(--red); }
+.livepod { display:flex; align-items:center; gap:14px; flex-wrap:wrap; background: var(--card);
+  border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin-bottom:28px; font-size:13px; color:#c9cedb; }
+.livepod code { background:#0b0d12; padding:1px 5px; border-radius:4px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.lp-lbl { font-size:11px; letter-spacing:.05em; color:var(--dim); font-weight:700; }
+.lp-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.lp-dot.good { background: var(--green); }
+.lp-dot.bad { background: var(--red); }
+.lp-dot.na { background: var(--dim); }
 .stage { display:flex; gap:16px; padding: 16px 0; border-left: 2px solid var(--border); margin-left: 13px; padding-left: 28px; position:relative; }
 .stage:last-child { border-left-color: transparent; }
 .stage .marker { position:absolute; left:-15px; top:14px; width:28px; height:28px; border-radius:50%;
@@ -344,6 +382,23 @@ function callRow(c, key, openKeys) {
     </div></details>`;
 }
 
+function livePodEl(lp) {
+  if (!lp) return '';
+  if (!lp.exists) {
+    return `<div class="livepod"><span class="lp-lbl">LIVE CLUSTER STATE</span><span class="lp-dot na"></span>` +
+      `Original pod <code>${esc(lp.name)}</code> no longer exists in <code>${esc(lp.namespace)}</code> - likely replaced by a rollout.</div>`;
+  }
+  const healthy = lp.phase === 'Running' && lp.ready;
+  return `<div class="livepod">
+    <span class="lp-lbl">LIVE CLUSTER STATE</span>
+    <span class="lp-dot ${healthy ? 'good' : 'bad'}"></span>
+    <span>Phase: <b>${esc(lp.phase)}</b></span>
+    <span>Ready: <b>${lp.ready ? 'Yes' : 'No'}</b></span>
+    <span>Restarts: <b>${lp.restart_count}</b></span>
+    <span>Node: <b>${esc(lp.node || 'unknown')}</b></span>
+  </div>`;
+}
+
 function stageEl(s, openKeys) {
   const cls = s.status;
   const icon = s.status === 'done' ? '&#10003;' : s.status === 'stopped' ? '&#10007;' : '';
@@ -390,6 +445,7 @@ function render(st) {
     (st.workload ? `<div class="badge">workload <b>${esc(st.workload)}</b></div>` : '') +
     (st.severity ? `<div class="badge sev-${st.severity}">severity <b>${esc(st.severity)}</b></div>` : '') +
     `</div>`;
+  html += livePodEl(st.live_pod);
   html += st.stages.map(s => stageEl(s, openKeys)).join('');
   if (st.outcome === 'resolved') {
     html += `<div class="outcome resolved"><h2>&#9989; Incident resolved</h2>${esc(st.final_text)}</div>`;

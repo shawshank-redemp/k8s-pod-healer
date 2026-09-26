@@ -1,0 +1,25 @@
+# ImagePullBackOff demo: the Deployment references an image tag that doesn't exist.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-image-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentinel-image
+  template:
+    metadata:
+      labels:
+        app: sentinel-image
+    spec:
+      containers:
+      - name: image-app
+        # Deliberately wrong tag - this exact image:tag does not exist on Docker Hub.
+        image: busybox:this-tag-does-not-exist-v9
+        command: ["/bin/sh", "-c", "sleep 3600"]
+        resources:
+          limits:
+            memory: "64Mi"
+            cpu: "250m"

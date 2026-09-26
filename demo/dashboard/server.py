@@ -82,7 +82,7 @@ def compute_state():
     agent_sessions = [s for s in sessions if (s.get("agent") or {}).get("name") == AGENT_NAME
                        and parse_ts(s["created_at"]) >= SERVER_START]
     if not agent_sessions:
-        return {"phase": "idle"}
+        return {"phase": "idle", "model": get_agent_model()}
     session = max(agent_sessions, key=lambda s: s["created_at"])
     sid = session["id"]
 
@@ -222,17 +222,17 @@ def compute_state():
          "card": alert_text,
          "link": {"href": f"{TRUEFORGE_URL}/sessions/{sid}", "label": "Open this session in TrueForge ↗"}},
         {"key": "investigating", "status": investigating_status, "title": "Investigating",
-         "oneliner": "Claude (via TrueForge) is reading the pod's spec, logs, and events." if investigating_status != "done" else "Claude (via TrueForge) read the pod's spec, logs, and events.",
+         "oneliner": "The agent (via TrueForge) is reading the pod's spec, logs, and events." if investigating_status != "done" else "The agent (via TrueForge) read the pod's spec, logs, and events.",
          "calls": investigating_calls},
         {"key": "sandbox", "status": sandbox_status, "title": "Sandbox verification (broken → healthy)",
-         "oneliner": "Claude is reproducing the exact failure, then applying and verifying its fix." if sandbox_status != "done" else "Claude reproduced the exact failure, then verified its fix recovers it.",
+         "oneliner": "The agent is reproducing the exact failure, then applying and verifying its fix." if sandbox_status != "done" else "The agent reproduced the exact failure, then verified its fix recovers it.",
          "calls": sandbox_calls},
-        {"key": "blast_radius", "status": blast_status, "title": "Blast-radius report (written by Claude)", "card": blast_radius},
+        {"key": "blast_radius", "status": blast_status, "title": "Blast-radius report (written by the agent)", "card": blast_radius},
         {"key": "approval", "status": approval_status, "title": "Awaiting your approval",
-         "oneliner": "Claude's TrueForge session is paused. Production write requires a human - nothing happens without you." if phase == "paused" else None,
+         "oneliner": "The agent's TrueForge session is paused. Production write requires a human - nothing happens without you." if phase == "paused" else None,
          "decision": decision, "show_buttons": phase == "paused"},
         {"key": "production", "status": production_status, "title": "Production",
-         "oneliner": "Claude is applying the approved patch, then verifying recovery." if production_status != "done" else "Claude applied the patch and verified it recovered.",
+         "oneliner": "The agent is applying the approved patch, then verifying recovery." if production_status != "done" else "The agent applied the patch and verified it recovered.",
          "calls": production_calls},
     ]
 
@@ -241,9 +241,24 @@ def compute_state():
         "pod": (session.get("metadata") or {}).get("pod"),
         "workload": (session.get("metadata") or {}).get("workload"),
         "severity": (session.get("metadata") or {}).get("severity"),
+        "model": get_agent_model(),
         "decision": decision, "outcome": outcome, "final_text": final_text, "stages": stages,
         "approval": approval_info,
     }
+
+
+def get_agent_model():
+    """Whichever model is actually configured for the agent right now - read live from TrueForge
+    rather than hardcoded, so this never goes stale if the provider is swapped (e.g. OpenAI <->
+    Anthropic <-> the rehearsal mock)."""
+    try:
+        agents = tf_get("/agents?limit=100") or []
+        agent = next((a for a in agents if a.get("name") == AGENT_NAME), None)
+        if agent:
+            return ((agent.get("manifest") or {}).get("model") or {}).get("name")
+    except (urllib.error.URLError, TimeoutError):
+        pass
+    return None
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -309,7 +324,7 @@ a.sess { color: var(--blue); font-size: 13px; }
 <div id="disconnected">&#9888; Lost connection to Sentinel's dashboard server - what's shown below is frozen, not live. Restart it and reload this page.</div>
 <div class="wrap">
   <h1><span class="dot" id="livedot"></span> Sentinel</h1>
-  <div class="sub" id="sub">Monitoring Kubernetes &middot; agent runtime: TrueForge (Claude)</div>
+  <div class="sub" id="sub">Monitoring Kubernetes &middot; agent runtime: TrueForge</div>
   <div id="root"></div>
 </div>
 <script>
@@ -355,8 +370,9 @@ async function approve(status) {
 function render(st) {
   $('livedot').className = 'dot' + (st.phase === 'running' || st.phase === 'paused' ? ' live' : '');
   const root = $('root');
+  const modelTag = st.model ? ` (${esc(st.model)})` : '';
   if (st.phase === 'idle') {
-    $('sub').innerHTML = 'Monitoring Kubernetes &middot; agent runtime: TrueForge (Claude)';
+    $('sub').innerHTML = `Monitoring Kubernetes &middot; agent runtime: TrueForge${modelTag}`;
     root.innerHTML = '<div class="idle"><div class="big">&#128994; System healthy</div>No active incident.</div>';
     return;
   }
@@ -365,7 +381,7 @@ function render(st) {
     root.innerHTML = `<div class="err">${esc(st.error)}</div>`;
     return;
   }
-  $('sub').innerHTML = `Agent runtime: TrueForge (Claude) &middot; <a class="sess" href="${st.session_url}" target="_blank">session ${st.session_id} ↗</a>`;
+  $('sub').innerHTML = `Agent runtime: TrueForge${modelTag} &middot; <a class="sess" href="${st.session_url}" target="_blank">session ${st.session_id} ↗</a>`;
   // The whole tracker re-renders every poll to stay live, which would otherwise snap any
   // manually-opened <details> row shut again on the next tick - carry the open set across.
   const openKeys = new Set(Array.from(root.querySelectorAll('details[open]')).map(d => d.dataset.key));

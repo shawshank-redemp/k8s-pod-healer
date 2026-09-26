@@ -264,31 +264,80 @@ def get_agent_model():
     return None
 
 
+def _kubectl(*args, timeout=5):
+    try:
+        out = subprocess.run(["kubectl", *args], capture_output=True, text=True, timeout=timeout)
+        return out.returncode, out.stdout
+    except Exception:
+        return 1, ""
+
+
+def _parse_quantity(q):
+    """Parse a Kubernetes resource quantity ('64Mi', '250m', '128974848') into a float in bytes
+    (for memory) or millicores (for cpu) - whichever unit the caller is already working in."""
+    if not q:
+        return None
+    q = str(q)
+    try:
+        if q.endswith("Ki"): return float(q[:-2]) * 1024
+        if q.endswith("Mi"): return float(q[:-2]) * 1024 * 1024
+        if q.endswith("Gi"): return float(q[:-2]) * 1024 * 1024 * 1024
+        if q.endswith("m"): return float(q[:-1])  # millicores
+        return float(q) * 1000  # bare cores -> millicores, or bare bytes for memory (caller cares)
+    except ValueError:
+        return None
+
+
 def get_live_pod_status(pod_ref):
     """Real, right-now status of the originally-alerted pod, straight from kubectl - not TrueForge,
     not cached, re-fetched on every poll. If the pod no longer exists (e.g. replaced by a rollout
-    after a fix), that's reported plainly rather than hidden - no fabricated numbers, ever."""
+    after a fix), that's reported plainly rather than hidden. CPU/memory come from `kubectl top`
+    (needs metrics-server) and are omitted - not faked - if the pod hasn't been sampled yet, e.g.
+    because it crashes faster than the metrics scrape interval. Recent events are the pod's real
+    Kubernetes events, newest first."""
     if not pod_ref or "/" not in pod_ref:
         return None
     namespace, name = pod_ref.split("/", 1)
+    rc, out = _kubectl("get", "pod", name, "-n", namespace, "-o", "json")
+    if rc != 0:
+        return {"exists": False, "namespace": namespace, "name": name}
     try:
-        out = subprocess.run(
-            ["kubectl", "get", "pod", name, "-n", namespace, "-o", "json"],
-            capture_output=True, text=True, timeout=5)
-        if out.returncode != 0:
-            return {"exists": False, "namespace": namespace, "name": name}
-        pod = json.loads(out.stdout)
-        containers = (pod.get("status") or {}).get("containerStatuses") or [{}]
-        cs = containers[0]
-        return {
-            "exists": True, "namespace": namespace, "name": name,
-            "phase": (pod.get("status") or {}).get("phase"),
-            "ready": bool(cs.get("ready", False)),
-            "restart_count": cs.get("restartCount", 0),
-            "node": (pod.get("spec") or {}).get("nodeName"),
-        }
-    except Exception:
-        return None
+        pod = json.loads(out)
+    except json.JSONDecodeError:
+        return {"exists": False, "namespace": namespace, "name": name}
+    containers = (pod.get("status") or {}).get("containerStatuses") or [{}]
+    cs = containers[0]
+    limits = ((pod.get("spec") or {}).get("containers") or [{}])[0].get("resources", {}).get("limits") or {}
+
+    cpu_used = mem_used = None
+    rc2, top_out = _kubectl("top", "pod", name, "-n", namespace, "--no-headers")
+    if rc2 == 0 and top_out.strip():
+        parts = top_out.split()
+        if len(parts) >= 3:
+            cpu_used, mem_used = parts[1], parts[2]
+
+    events = []
+    rc3, ev_out = _kubectl("get", "events", "-n", namespace,
+                            f"--field-selector=involvedObject.name={name}",
+                            "--sort-by=.lastTimestamp", "-o", "json")
+    if rc3 == 0 and ev_out.strip():
+        try:
+            items = json.loads(ev_out).get("items") or []
+            for e in items[-4:][::-1]:
+                events.append({"reason": e.get("reason"), "message": (e.get("message") or "")[:90]})
+        except json.JSONDecodeError:
+            pass
+
+    return {
+        "exists": True, "namespace": namespace, "name": name,
+        "phase": (pod.get("status") or {}).get("phase"),
+        "ready": bool(cs.get("ready", False)),
+        "restart_count": cs.get("restartCount", 0),
+        "node": (pod.get("spec") or {}).get("nodeName"),
+        "cpu_used": cpu_used, "cpu_limit": limits.get("cpu"),
+        "mem_used": mem_used, "mem_limit": limits.get("memory"),
+        "events": events,
+    }
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -317,6 +366,19 @@ h1 { font-size: 26px; margin: 0 0 4px; display:flex; align-items:center; gap:12p
 .lp-dot.good { background: var(--green); }
 .lp-dot.bad { background: var(--red); }
 .lp-dot.na { background: var(--dim); }
+.lp-top { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+.lp-facts { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; }
+.lp-res { display:flex; align-items:center; gap:10px; margin:6px 0; font-size:12.5px; }
+.lp-res-label { width:32px; color:var(--dim); font-weight:700; }
+.lp-bar-wrap { flex:1; max-width:200px; height:7px; background:#0b0d12; border-radius:4px; overflow:hidden; }
+.lp-bar { height:100%; background: var(--green); }
+.lp-bar.warn { background: var(--amber); }
+.lp-bar.crit { background: var(--red); }
+.lp-res-val { color:#c9cedb; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.lp-unavail { color: var(--dim); font-style: italic; font-size:12.5px; }
+.lp-events-wrap { margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
+.lp-event { font-size:12.5px; color:#c9cedb; margin:3px 0; }
+.lp-event b { color:var(--amber); }
 .stage { display:flex; gap:16px; padding: 16px 0; border-left: 2px solid var(--border); margin-left: 13px; padding-left: 28px; position:relative; }
 .stage:last-child { border-left-color: transparent; }
 .stage .marker { position:absolute; left:-15px; top:14px; width:28px; height:28px; border-radius:50%;
@@ -382,20 +444,49 @@ function callRow(c, key, openKeys) {
     </div></details>`;
 }
 
+function parseQty(q) {
+  if (!q) return null;
+  q = String(q);
+  if (q.endsWith('Ki')) return parseFloat(q) * 1024;
+  if (q.endsWith('Mi')) return parseFloat(q) * 1024 * 1024;
+  if (q.endsWith('Gi')) return parseFloat(q) * 1024 * 1024 * 1024;
+  if (q.endsWith('m')) return parseFloat(q);
+  const n = parseFloat(q);
+  return isNaN(n) ? null : n * 1000;
+}
+
+function resourceRow(label, used, limit) {
+  const u = parseQty(used), l = parseQty(limit);
+  if (u == null || l == null || !l) {
+    return `<div class="lp-res"><span class="lp-res-label">${label}</span><span class="lp-unavail">Metric unavailable</span></div>`;
+  }
+  const pct = Math.min(100, Math.round((u / l) * 100));
+  const cls = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : 'ok';
+  return `<div class="lp-res"><span class="lp-res-label">${label}</span>
+    <div class="lp-bar-wrap"><div class="lp-bar ${cls}" style="width:${pct}%"></div></div>
+    <span class="lp-res-val">${esc(used)} / ${esc(limit)}</span></div>`;
+}
+
 function livePodEl(lp) {
   if (!lp) return '';
   if (!lp.exists) {
-    return `<div class="livepod"><span class="lp-lbl">LIVE CLUSTER STATE</span><span class="lp-dot na"></span>` +
+    return `<div class="livepod"><div class="lp-top"><span class="lp-lbl">LIVE CLUSTER STATE</span><span class="lp-dot na"></span></div>` +
       `Original pod <code>${esc(lp.name)}</code> no longer exists in <code>${esc(lp.namespace)}</code> - likely replaced by a rollout.</div>`;
   }
   const healthy = lp.phase === 'Running' && lp.ready;
+  const events = (lp.events || []).map(e =>
+    `<div class="lp-event"><b>${esc(e.reason)}</b> ${esc(e.message)}</div>`).join('');
   return `<div class="livepod">
-    <span class="lp-lbl">LIVE CLUSTER STATE</span>
-    <span class="lp-dot ${healthy ? 'good' : 'bad'}"></span>
-    <span>Phase: <b>${esc(lp.phase)}</b></span>
-    <span>Ready: <b>${lp.ready ? 'Yes' : 'No'}</b></span>
-    <span>Restarts: <b>${lp.restart_count}</b></span>
-    <span>Node: <b>${esc(lp.node || 'unknown')}</b></span>
+    <div class="lp-top"><span class="lp-lbl">LIVE CLUSTER STATE</span><span class="lp-dot ${healthy ? 'good' : 'bad'}"></span></div>
+    <div class="lp-facts">
+      <span>Phase: <b>${esc(lp.phase)}</b></span>
+      <span>Ready: <b>${lp.ready ? 'Yes' : 'No'}</b></span>
+      <span>Restarts: <b>${lp.restart_count}</b></span>
+      <span>Node: <b>${esc(lp.node || 'unknown')}</b></span>
+    </div>
+    ${resourceRow('CPU', lp.cpu_used, lp.cpu_limit)}
+    ${resourceRow('MEM', lp.mem_used, lp.mem_limit)}
+    ${events ? `<div class="lp-events-wrap"><div class="lp-lbl" style="margin-bottom:6px">RECENT EVENTS</div>${events}</div>` : ''}
   </div>`;
 }
 
